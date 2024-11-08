@@ -1,5 +1,5 @@
 '''
-Copyright (C) 2017-2024 Bryant Moscon - bmoscon@gmail.com
+Copyright (C) 2024 Huyen Ha - hathehuyen@gmail.com
 
 Please see the LICENSE file for the terms and conditions
 associated with this software.
@@ -8,7 +8,8 @@ from collections import defaultdict
 from datetime import datetime as dt
 from typing import Tuple
 
-import asyncpg
+import acsylla
+
 from yapic import json
 
 from cryptofeed.backends.backend import BackendBookCallback, BackendCallback, BackendQueue
@@ -16,10 +17,10 @@ from cryptofeed.defines import CANDLES, FUNDING, OPEN_INTEREST, TICKER, TRADES, 
 
 
 class ScyllaCallback(BackendQueue):
-    def __init__(self, host='127.0.0.1', user=None, pw=None, db=None, port=None, table=None, custom_columns: dict = None, none_to=None, numeric_type=float, **kwargs):
+    def __init__(self, cluster_addresses=['172.17.0.2', '172.17.0.3', '172.17.0.4'], key_space='my_keyspace', user=None, pw=None, db=None, port=None, table=None, custom_columns: dict = None, none_to=None, numeric_type=float, **kwargs):
         """
-        host: str
-            Database host address
+        cluster_addresses: Array
+            Database cluster addresses
         user: str
             The name of the database role used for authentication.
         db: str
@@ -33,24 +34,20 @@ class ScyllaCallback(BackendQueue):
             Can be a subset of Cryptofeed's available fields (see the cdefs listed under each data type in types.pyx). Can be listed any order.
             Note: to store BOOK data in a JSONB column, include a 'data' field, e.g. {'symbol': 'symbol', 'data': 'json_data'}
         """
-        self.conn = None
+        self.session = None
         self.table = table if table else self.default_table
         self.custom_columns = custom_columns
         self.numeric_type = numeric_type
         self.none_to = none_to
-        self.user = user
-        self.db = db
-        self.pw = pw
-        self.host = host
-        self.port = port
-        # Parse INSERT statement with user-specified column names
-        # Performed at init to avoid repeated list joins
-        self.insert_statement = f"INSERT INTO {self.table} ({','.join([v for v in self.custom_columns.values()])}) VALUES " if custom_columns else None
+        self.cluster_addresses = cluster_addresses
+        self.key_space = key_space
+        self.insert_statement = f"INSERT INTO {self.key_space}.{self.table} ({','.join([v for v in self.custom_columns.values()])}) VALUES " if custom_columns else None
         self.running = True
 
     async def _connect(self):
-        if self.conn is None:
-            self.conn = await asyncpg.connect(user=self.user, password=self.pw, database=self.db, host=self.host, port=self.port)
+        if self.session is None:
+            self.cluster = acsylla.create_cluster(self.cluster_addresses)
+            self.session = await self.cluster.create_session(keyspace=self.key_space)
 
     def format(self, data: Tuple):
         feed = data[0]
@@ -91,19 +88,21 @@ class ScyllaCallback(BackendQueue):
                     await self.write_batch(batch)
 
     async def write_batch(self, updates: list):
-        await self._connect()
-        args_str = ','.join([self.format(u) for u in updates])
-
-        async with self.conn.transaction():
-            try:
-                if self.custom_columns:
-                    await self.conn.execute(self.insert_statement + args_str)
-                else:
-                    await self.conn.execute(f"INSERT INTO {self.table} VALUES {args_str}")
-
-            except asyncpg.UniqueViolationError:
-                # when restarting a subscription, some exchanges will re-publish a few messages
-                pass
+        try:
+            await self._connect()
+            CQL = f"""
+                INSERT INTO {self.key_space}.{self.table} (exchange, symbol, timestamp, receipt, data)
+                VALUES (?, ?, ?, ?, ?)
+                """
+            prepaired = await self.session.create_prepared(CQL)
+            statement = prepaired.bind()
+            # print('Write batch', CQL)
+            for update in updates:
+                statement.bind_list(self.format(update))
+                await self.session.execute(statement)
+                # print('Write update:', self.format(update))
+        except Exception as e:
+            print(e)
 
 
 class TradeScylla(ScyllaCallback, BackendCallback):
@@ -114,9 +113,14 @@ class TradeScylla(ScyllaCallback, BackendCallback):
             return self._custom_format(data)
         else:
             exchange, symbol, timestamp, receipt, data = data
-            id = f"'{data['id']}'" if data['id'] else 'NULL'
-            otype = f"'{data['type']}'" if data['type'] else 'NULL'
-            return f"(DEFAULT,'{timestamp}','{receipt}','{exchange}','{symbol}','{data['side']}',{data['amount']},{data['price']},{id},{otype})"
+            data_minimized = [
+                data['id'] if data['id'] else 'NULL',
+                data['side'] if data['side'] else 'NULL',
+                data['amount'] if data['amount'] else 'NULL',
+                data['price'] if data['price'] else 'NULL',
+                data['type'] if data['type'] else 'NULL'
+            ]
+            return [exchange, symbol, timestamp, receipt, data_minimized]
 
 
 class FundingScylla(ScyllaCallback, BackendCallback):
