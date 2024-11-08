@@ -42,6 +42,11 @@ class ScyllaCallback(BackendQueue):
         self.cluster_addresses = cluster_addresses
         self.key_space = key_space
         self.insert_statement = f"INSERT INTO {self.key_space}.{self.table} ({','.join([v for v in self.custom_columns.values()])}) VALUES " if custom_columns else None
+        self.CQL = f"""
+            INSERT INTO {self.key_space}.{self.table}
+            (exchange, symbol, timestamp, receipt, data)
+            VALUES (?, ?, ?, ?, ?)
+            """
         self.running = True
 
     async def _connect(self):
@@ -90,19 +95,16 @@ class ScyllaCallback(BackendQueue):
     async def write_batch(self, updates: list):
         try:
             await self._connect()
-            CQL = f"""
-                INSERT INTO {self.key_space}.{self.table} (exchange, symbol, timestamp, receipt, data)
-                VALUES (?, ?, ?, ?, ?)
-                """
-            prepaired = await self.session.create_prepared(CQL)
+            prepaired = await self.session.create_prepared(self.CQL)
             statement = prepaired.bind()
-            # print('Write batch', CQL)
+            print('Write batch scylla:', self.CQL)
             for update in updates:
                 statement.bind_list(self.format(update))
                 await self.session.execute(statement)
-                # print('Write update:', self.format(update))
+                print('Write update scylla:', self.format(update))
         except Exception as e:
             print(e)
+
 
 
 class TradeScylla(ScyllaCallback, BackendCallback):
@@ -213,15 +215,30 @@ class BookScylla(ScyllaCallback, BackendBookCallback):
 
 class CandlesScylla(ScyllaCallback, BackendCallback):
     default_table = CANDLES
-
+    
     def format(self, data: Tuple):
         if self.custom_columns:
-            data[4]['start'] = dt.utcfromtimestamp(data[4]['start'])
-            data[4]['stop'] = dt.utcfromtimestamp(data[4]['stop'])
             return self._custom_format(data)
         else:
+            start = dt.utcfromtimestamp(data[4]['start'])
+            stop = dt.utcfromtimestamp(data[4]['stop'])
             exchange, symbol, timestamp, receipt, data = data
+            return [exchange, symbol, timestamp, receipt, start, stop, data]
 
-            open_ts = dt.utcfromtimestamp(data['start'])
-            close_ts = dt.utcfromtimestamp(data['stop'])
-            return f"(DEFAULT,'{timestamp}','{receipt}','{exchange}','{symbol}','{open_ts}','{close_ts}','{data['interval']}',{data['trades'] if data['trades'] is not None else 'NULL'},{data['open']},{data['close']},{data['high']},{data['low']},{data['volume']},{data['closed'] if data['closed'] else 'NULL'})"
+    async def write_batch(self, updates: list):
+        try:
+            await self._connect()
+            self.CQL = f"""
+                INSERT INTO {self.key_space}.{self.table}
+                (exchange, symbol, timestamp, receipt, start, stop, data)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """
+            prepaired = await self.session.create_prepared(self.CQL)
+            statement = prepaired.bind()
+            print('Write batch candles', self.CQL)
+            for update in updates:
+                statement.bind_list(self.format(update))
+                await self.session.execute(statement)
+                print('Write update candles:', self.format(update))
+        except Exception as e:
+            print(e)
