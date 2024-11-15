@@ -9,7 +9,7 @@ from datetime import datetime as dt
 from typing import Tuple
 
 import acsylla
-
+import time
 from yapic import json
 
 from cryptofeed.backends.backend import BackendBookCallback, BackendCallback, BackendQueue
@@ -47,6 +47,8 @@ class ScyllaCallback(BackendQueue):
             (exchange, symbol, timestamp, receipt, data)
             VALUES (?, ?, ?, ?, ?)
             """
+        self.window = 1
+        self.last_update = 0
         self.running = True
 
     async def _connect(self):
@@ -106,6 +108,36 @@ class ScyllaCallback(BackendQueue):
             print(e)
 
 
+class CandlesScylla(ScyllaCallback, BackendCallback):
+    default_table = CANDLES
+    
+    def format(self, data: Tuple):
+        if self.custom_columns:
+            return self._custom_format(data)
+        else:
+            start = dt.utcfromtimestamp(data[4]['start'])
+            stop = dt.utcfromtimestamp(data[4]['stop'])
+            exchange, symbol, timestamp, receipt, data = data
+            return [exchange, symbol, timestamp, receipt, start, stop, data]
+
+    async def write_batch(self, updates: list):
+        try:
+            await self._connect()
+            self.CQL = f"""
+                INSERT INTO {self.key_space}.{self.table}
+                (exchange, symbol, timestamp, receipt, start, stop, data)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """
+            prepaired = await self.session.create_prepared(self.CQL)
+            statement = prepaired.bind()
+            print('Write batch candles', self.CQL)
+            for update in updates:
+                statement.bind_list(self.format(update))
+                await self.session.execute(statement)
+                print('Write update candles:', self.format(update))
+        except Exception as e:
+            print(e)
+
 
 class TradeScylla(ScyllaCallback, BackendCallback):
     default_table = TRADES
@@ -125,6 +157,18 @@ class TradeScylla(ScyllaCallback, BackendCallback):
             return [exchange, symbol, timestamp, receipt, data_minimized]
 
 
+class OpenInterestScylla(ScyllaCallback, BackendCallback):
+    default_table = OPEN_INTEREST
+
+    def format(self, data: Tuple):
+        if self.custom_columns:
+            return self._custom_format(data)
+        else:
+            exchange, symbol, timestamp, receipt, data = data
+            data_minimized = data['open_interest']
+            return [exchange, symbol, timestamp, receipt, data_minimized]
+
+
 class FundingScylla(ScyllaCallback, BackendCallback):
     default_table = FUNDING
 
@@ -135,41 +179,13 @@ class FundingScylla(ScyllaCallback, BackendCallback):
             return self._custom_format(data)
         else:
             exchange, symbol, timestamp, receipt, data = data
-            ts = dt.utcfromtimestamp(data['next_funding_time']) if data['next_funding_time'] else 'NULL'
-            return f"(DEFAULT,'{timestamp}','{receipt}','{exchange}','{symbol}',{data['mark_price'] if data['mark_price'] else 'NULL'},{data['rate']},'{ts}',{data['predicted_rate']})"
-
-
-class TickerScylla(ScyllaCallback, BackendCallback):
-    default_table = TICKER
-
-    def format(self, data: Tuple):
-        if self.custom_columns:
-            return self._custom_format(data)
-        else:
-            exchange, symbol, timestamp, receipt, data = data
-            return f"(DEFAULT,'{timestamp}','{receipt}','{exchange}','{symbol}',{data['bid']},{data['ask']})"
-
-
-class OpenInterestScylla(ScyllaCallback, BackendCallback):
-    default_table = OPEN_INTEREST
-
-    def format(self, data: Tuple):
-        if self.custom_columns:
-            return self._custom_format(data)
-        else:
-            exchange, symbol, timestamp, receipt, data = data
-            return f"(DEFAULT,'{timestamp}','{receipt}','{exchange}','{symbol}',{data['open_interest']})"
-
-
-class IndexScylla(ScyllaCallback, BackendCallback):
-    default_table = INDEX
-
-    def format(self, data: Tuple):
-        if self.custom_columns:
-            return self._custom_format(data)
-        else:
-            exchange, symbol, timestamp, receipt, data = data
-            return f"(DEFAULT,'{timestamp}','{receipt}','{exchange}','{symbol}',{data['price']})"
+            data_minimized = [
+                data['mark_price'],
+                data['rate'],
+                data['next_funding_time'],
+                data['predicted_rate']
+            ]
+            return [exchange, symbol, timestamp, receipt, data_minimized]
 
 
 class LiquidationsScylla(ScyllaCallback, BackendCallback):
@@ -180,7 +196,52 @@ class LiquidationsScylla(ScyllaCallback, BackendCallback):
             return self._custom_format(data)
         else:
             exchange, symbol, timestamp, receipt, data = data
-            return f"(DEFAULT,'{timestamp}','{receipt}','{exchange}','{symbol}','{data['side']}',{data['quantity']},{data['price']},'{data['id']}','{data['status']}')"
+            # data_minimized = [
+            #     data['mark_price'],
+            #     data['rate'],
+            #     data['next_funding_time'],
+            #     data['predicted_rate']
+            # ]
+            return [exchange, symbol, timestamp, receipt, data]
+
+
+class TickerScylla(ScyllaCallback, BackendCallback):
+    default_table = TICKER
+
+    def format(self, data: Tuple):
+        if self.custom_columns:
+            return self._custom_format(data)
+        else:
+            exchange, symbol, timestamp, receipt, data = data
+            data_minimized = [
+                data['bid'],
+                data['ask']
+            ]
+            return [exchange, symbol, timestamp, receipt, data_minimized]
+    
+    # Throttle updates based on `window`. Will allow 1 update per `window` interval; all others are dropped
+    async def __call__(self, data, receipt_timestamp):
+        now = time.time()
+        if now - self.last_update > self.window:
+            self.last_update = now
+            await super().__call__(data, receipt_timestamp)
+
+
+class IndexScylla(ScyllaCallback, BackendCallback):
+    default_table = INDEX
+
+    def format(self, data: Tuple):
+        if self.custom_columns:
+            return self._custom_format(data)
+        else:
+            exchange, symbol, timestamp, receipt, data = data
+            # data_minimized = [
+            #     data['mark_price'],
+            #     data['rate'],
+            #     data['next_funding_time'],
+            #     data['predicted_rate']
+            # ]
+            return [exchange, symbol, timestamp, receipt, data]
 
 
 class BookScylla(ScyllaCallback, BackendBookCallback):
@@ -212,33 +273,3 @@ class BookScylla(ScyllaCallback, BackendBookCallback):
 
             return f"(DEFAULT,'{timestamp}','{receipt_timestamp}','{feed}','{symbol}','{json.dumps(data)}')"
 
-
-class CandlesScylla(ScyllaCallback, BackendCallback):
-    default_table = CANDLES
-    
-    def format(self, data: Tuple):
-        if self.custom_columns:
-            return self._custom_format(data)
-        else:
-            start = dt.utcfromtimestamp(data[4]['start'])
-            stop = dt.utcfromtimestamp(data[4]['stop'])
-            exchange, symbol, timestamp, receipt, data = data
-            return [exchange, symbol, timestamp, receipt, start, stop, data]
-
-    async def write_batch(self, updates: list):
-        try:
-            await self._connect()
-            self.CQL = f"""
-                INSERT INTO {self.key_space}.{self.table}
-                (exchange, symbol, timestamp, receipt, start, stop, data)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """
-            prepaired = await self.session.create_prepared(self.CQL)
-            statement = prepaired.bind()
-            print('Write batch candles', self.CQL)
-            for update in updates:
-                statement.bind_list(self.format(update))
-                await self.session.execute(statement)
-                print('Write update candles:', self.format(update))
-        except Exception as e:
-            print(e)
